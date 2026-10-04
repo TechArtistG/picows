@@ -19,10 +19,10 @@ size_t apply_mask_sse2(uint8_t* input, size_t input_len, size_t start_pos, uint3
         int_x out2 = _mm_xor_si128(in2, mask_x);
         int_x out3 = _mm_xor_si128(in3, mask_x);
         int_x out4 = _mm_xor_si128(in4, mask_x);
-        _mm_stream_si128((int_x *)(output + i), out1);
-        _mm_stream_si128((int_x *)(output + i + 16), out2);
-        _mm_stream_si128((int_x *)(output + i + 32), out3);
-        _mm_stream_si128((int_x *)(output + i + 48), out4);
+        _mm_store_si128((int_x *)(output + i), out1);
+        _mm_store_si128((int_x *)(output + i + 16), out2);
+        _mm_store_si128((int_x *)(output + i + 32), out3);
+        _mm_store_si128((int_x *)(output + i + 48), out4);
     }
 
     return start_pos + input_len_trunc;

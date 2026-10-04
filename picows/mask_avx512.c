@@ -13,7 +13,7 @@ size_t apply_mask_avx512(uint8_t* input, size_t input_len, size_t start_pos, uin
     {
         int_x in = _mm512_load_si512((int_x *)(input  + i));
         int_x out = _mm512_xor_si512(in, mask_x);
-        _mm512_stream_si512((int_x *)(output + i), out);
+        _mm512_store_si512((int_x *)(output + i), out);
     }
 
     return start_pos + input_len_trunc;
