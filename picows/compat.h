@@ -91,7 +91,8 @@ size_t          get_apply_mask_fast_alignment(void);
 static inline size_t rotate_right(uint32_t value, size_t num_bytes)
 {
     const uint32_t bits = (num_bytes % 4) * 8;
-    return (value >> bits) | (value << (32 - bits));
+    // (32 - bits) & 31 avoids shifting a 32-bit value by 32 (UB) when bits == 0
+    return (value >> bits) | (value << ((32 - bits) & 31));
 }
 
 static inline size_t apply_mask_1(uint8_t* input, size_t input_len, size_t start_pos, uint32_t mask, uint8_t* output)
@@ -106,8 +107,8 @@ static inline size_t apply_mask_1(uint8_t* input, size_t input_len, size_t start
 
 static inline size_t apply_mask_4(uint8_t* input, size_t input_len, size_t start_pos, uint32_t mask, uint8_t* output)
 {
-    typedef uint64_t int_x;
-    const size_t reg_size = 4;
+    typedef uint32_t int_x;
+    const size_t reg_size = sizeof(int_x);
     const size_t input_len_trunc = (input_len - start_pos) & ~(reg_size - 1);
     const int_x mask_x = mask;
 
