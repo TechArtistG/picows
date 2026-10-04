@@ -32,7 +32,8 @@ Unreleased
   per key; the keystream block is refilled after a frame has been written, so it never delays a send.
 * Automatic PONG replies are sent after all frames of the current read have been delivered, so frames
   following a PING are no longer delayed by the PONG write (measured 7 us TCP / 12 us TLS per write). Only the
-  last PING of a read is answered, as allowed by RFC 6455 5.5.3.
+  last PING of a read is answered, as allowed by RFC 6455 5.5.3, and no PONG is sent once a CLOSE has been
+  received (RFC 6455 5.5.2).
 * Writes to aiofastnet transports go through aiofastnet's C-level ``write_c`` instead of a Python
   ``get_write_buffer_size()`` call plus a memoryview and a Python ``write`` call. Measured per-send overhead
   (excluding the syscall) 1.66 → 1.02 us on TCP and 1.21 → 0.90 us on TLS.

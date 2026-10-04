@@ -1571,10 +1571,14 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
     cdef inline NoResult _send_pending_pong(self) except NoResult.EXC:
         # PONG is sent after all frames of the read have been delivered, so that frames
         # following a PING aren't delayed by the PONG write. If several PINGs arrived in
-        # one read, only the last one is answered (RFC 6455 5.5.3).
+        # one read, only the last one is answered (RFC 6455 5.5.3). No PONG is sent once
+        # a CLOSE has been received (RFC 6455 5.5.2).
         if cython.unlikely(self._pending_pong_payload is not None):
             payload = self._pending_pong_payload
             self._pending_pong_payload = None
+            close_handshake = self.transport.close_handshake
+            if close_handshake is not None and close_handshake.recv is not None:
+                return NoResult.SUCCESS
             self.transport.send_pong(payload)
             if self._log_debug_enabled:
                 self._logger.log(_DEBUG_LL, "Replied with PONG(%s)", payload)

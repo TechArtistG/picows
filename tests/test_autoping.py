@@ -351,10 +351,9 @@ async def test_roundtrip_latency_disconnect(with_auto_ping):
                     await client.transport.measure_roundtrip_time(5)
 
 
-async def test_auto_pong_sent_after_frames_of_the_same_read():
-    # PING(a) + PING(b) + TEXT arrive in one read. The TEXT frame must be delivered without
-    # waiting for the PONG write, so the client's reply to TEXT is on the wire before the PONG.
-    # Only the last PING of the read is answered (RFC 6455 5.5.3).
+async def _client_frames_after(server_frames: bytes, listener_factory, **connect_kwargs):
+    # Raw server: completes the upgrade, writes server_frames in one write and returns all frames the
+    # client sends afterwards (until 0.2s of silence or EOF), as (msg_type, unmasked payload).
     received = []
     done = asyncio.get_running_loop().create_future()
 
@@ -372,31 +371,45 @@ async def test_auto_pong_sent_after_frames_of_the_same_read():
         accept = base64.b64encode(hashlib.sha1(ws_key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
         writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
-        writer.write(b"\x89\x01a" + b"\x89\x01b" + b"\x81\x04data")
-        received.append(await read_frame(reader))
-        received.append(await read_frame(reader))
+        writer.write(server_frames)
         try:
-            async with async_timeout.timeout(0.2):
-                received.append(await read_frame(reader))
-        except asyncio.TimeoutError:
+            while True:
+                async with async_timeout.timeout(0.2):
+                    received.append(await read_frame(reader))
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             pass
         done.set_result(None)
         writer.close()
-
-    class ClientListener(picows.WSListener):
-        def on_ws_frame(self, transport: picows.WSTransport, frame: picows.WSFrame):
-            if frame.msg_type == picows.WSMsgType.TEXT:
-                transport.send(picows.WSMsgType.TEXT, b"reply")
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
         async with async_timeout.timeout(TIMEOUT):
-            transport, _ = await picows.ws_connect(ClientListener, f"ws://127.0.0.1:{port}/", enable_auto_pong=True)
+            transport, _ = await picows.ws_connect(listener_factory, f"ws://127.0.0.1:{port}/", **connect_kwargs)
             await done
             transport.disconnect()
     finally:
         server.close()
         await server.wait_closed()
+    return received
 
+
+async def test_auto_pong_sent_after_frames_of_the_same_read():
+    # PING(a) + PING(b) + TEXT arrive in one read. The TEXT frame must be delivered without
+    # waiting for the PONG write, so the client's reply to TEXT is on the wire before the PONG.
+    # Only the last PING of the read is answered (RFC 6455 5.5.3).
+    class ClientListener(picows.WSListener):
+        def on_ws_frame(self, transport: picows.WSTransport, frame: picows.WSFrame):
+            if frame.msg_type == picows.WSMsgType.TEXT:
+                transport.send(picows.WSMsgType.TEXT, b"reply")
+
+    received = await _client_frames_after(b"\x89\x01a" + b"\x89\x01b" + b"\x81\x04data", ClientListener,
+                                          enable_auto_pong=True)
     assert received == [(picows.WSMsgType.TEXT, b"reply"), (picows.WSMsgType.PONG, b"b")]
+
+
+async def test_no_auto_pong_after_close_received_in_the_same_read():
+    # PING + CLOSE arrive in one read. RFC 6455 5.5.2: no PONG once a CLOSE has been received.
+    received = await _client_frames_after(b"\x89\x01a" + b"\x88\x02\x03\xe8", picows.WSListener,
+                                          enable_auto_pong=True)
+    assert received == []

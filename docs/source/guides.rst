@@ -216,6 +216,7 @@ manually from :any:`on_ws_frame`.
 The PONG is sent after all frames received in the same read have been delivered to
 :any:`on_ws_frame`, so frames that follow a PING aren't delayed by the PONG write.
 If several PINGs arrive in one read, only the last one is answered, as allowed by RFC 6455.
+No PONG is sent if a CLOSE frame was received in the same read.
 
 .. code-block:: python
 
