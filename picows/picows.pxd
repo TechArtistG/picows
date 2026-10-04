@@ -12,10 +12,7 @@ cdef enum NoResult:
 
 cdef enum WSParserState:
     WAIT_UPGRADE_RESPONSE = 0
-    READ_HEADER = 1
-    READ_PAYLOAD_LENGTH = 2
-    READ_PAYLOAD_MASK = 3
-    READ_PAYLOAD = 4
+    READ_FRAMES = 1
 
 
 cpdef enum WSMsgType:

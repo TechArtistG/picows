@@ -1299,23 +1299,13 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
 
         object _extra_headers
 
-        # The following are the parts of an unfinished frame
-        # Once the frame is finished WSFrame is created and returned
+        # Read buffer: [0, _f_curr_frame_start_pos) has been delivered, a partially received frame
+        # starts at _f_curr_frame_start_pos, new data is written at _f_new_data_start_pos.
+        # Nothing else is stored for a partially received frame, its header is re-parsed.
         WSParserState _state
         MemoryBuffer _read_buffer
         Py_ssize_t _f_new_data_start_pos
-        Py_ssize_t _f_curr_state_start_pos
         Py_ssize_t _f_curr_frame_start_pos
-        Py_ssize_t _f_payload_length
-        Py_ssize_t _f_payload_start_pos
-        WSMsgType _f_msg_type
-        uint32_t _f_mask
-        uint8_t _f_fin
-        uint8_t _f_rsv1
-        uint8_t _f_rsv2
-        uint8_t _f_rsv3
-        uint8_t _f_has_mask
-        uint8_t _f_payload_length_flag
 
     def __init__(self,
                  str host_port,
@@ -1372,18 +1362,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         self._read_buffer = MemoryBuffer(max(<Py_ssize_t>read_buffer_init_size, 2048))
         self._read_buffer.size = self._read_buffer.capacity - 256 # Leave space for simd parsers
         self._f_new_data_start_pos = 0
-        self._f_curr_state_start_pos = 0
         self._f_curr_frame_start_pos = 0
-        self._f_payload_length = 0
-        self._f_payload_start_pos = 0
-        self._f_msg_type = WSMsgType.CLOSE
-        self._f_mask = 0
-        self._f_fin = 0
-        self._f_rsv1 = 0
-        self._f_rsv2 = 0
-        self._f_rsv3 = 0
-        self._f_has_mask = 0
-        self._f_payload_length_flag = 0
 
     def connection_made(self, transport):
         sock = transport.get_extra_info('socket')
@@ -1680,7 +1659,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
                 return False
 
             self.transport.listener_proxy = weakref.proxy(self.listener)
-            self._state = WSParserState.READ_HEADER
+            self._state = WSParserState.READ_FRAMES
             self.transport._send_http_handshake_response(response, accept_val)
 
         if self._handshake_timeout_handle is not None:
@@ -1814,7 +1793,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         cdef Py_ssize_t header_size = header_end + 4
         memmove(self._read_buffer.data, self._read_buffer.data + header_size, self._read_buffer.size - header_size)
         self._f_new_data_start_pos = len(data) - header_size
-        self._state = WSParserState.READ_HEADER
+        self._state = WSParserState.READ_FRAMES
         if cython.unlikely(self._log_debug_enabled):
             self._logger.log(_DEBUG_LL, "WS handshake done, switch to upgraded state")
 
@@ -1833,184 +1812,169 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         return NoResult.SUCCESS
 
     cdef inline WSFrame _get_next_frame_impl(self): #  -> Optional[WSFrame]
-        """Return the next frame from the socket."""
+        """Return the next complete frame from the read buffer, or None if more data is needed.
+
+        The header is parsed from the frame start on every call and kept in locals; nothing is
+        stored for partially received frames. Headers are at most 14 bytes, so re-parsing while
+        a large payload is still arriving is negligible.
+        """
         cdef:
+            char* data = self._read_buffer.data
+            Py_ssize_t frame_start = self._f_curr_frame_start_pos
+            Py_ssize_t data_end = self._f_new_data_start_pos
+            Py_ssize_t pos = frame_start + 2
             uint8_t first_byte
             uint8_t second_byte
+            uint8_t fin
+            uint8_t has_mask
+            uint8_t payload_length_flag
             uint64_t host_len_64
+            Py_ssize_t payload_length
+            uint32_t mask = 0
+            WSMsgType msg_type
             WSFrame frame
             WSCloseInfo recv
 
-        if self._state == WSParserState.READ_HEADER:
-            if self._f_new_data_start_pos - self._f_curr_state_start_pos < 2:
+        if data_end - frame_start < 2:
+            return None
+
+        first_byte = <uint8_t>data[frame_start]
+        second_byte = <uint8_t>data[frame_start + 1]
+        fin = (first_byte >> 7) & 1
+        msg_type = <WSMsgType>(first_byte & 0xF)
+        if msg_type not in (
+                WSMsgType.TEXT,
+                WSMsgType.BINARY,
+                WSMsgType.PING,
+                WSMsgType.PONG,
+                WSMsgType.CLOSE,
+                WSMsgType.CONTINUATION):
+            raise WSProtocolError(
+                WSCloseCode.PROTOCOL_ERROR,
+                f"Received frame with invalid opcode={msg_type:#x}",
+            )
+
+        if msg_type > 0x7 and not fin:
+            raise WSProtocolError(
+                WSCloseCode.PROTOCOL_ERROR,
+                "Received fragmented control frame",
+            )
+
+        has_mask = (second_byte >> 7) & 1
+        if self.is_client_side and has_mask:
+            raise WSProtocolError(
+                WSCloseCode.PROTOCOL_ERROR,
+                "Received masked frame from server, RFC 6455 section 5.1 forbids this",
+            )
+        elif not self.is_client_side and not has_mask:
+            raise WSProtocolError(
+                WSCloseCode.PROTOCOL_ERROR,
+                "Received un-masked frame from client, RFC 6455 section 5.1 forbids this",
+            )
+
+        payload_length_flag = second_byte & 0x7F
+
+        if (msg_type in (WSMsgType.PING, WSMsgType.PONG, WSMsgType.CLOSE)
+                and payload_length_flag > 125):
+            raise WSProtocolError(
+                WSCloseCode.PROTOCOL_ERROR,
+                f"Received control frame with payload size > 125 bytes, opcode={msg_type:#x}",
+            )
+
+        if payload_length_flag == 126:
+            if data_end - pos < 2:
                 return None
-
-            first_byte = <uint8_t>self._read_buffer.data[self._f_curr_state_start_pos]
-            second_byte = <uint8_t>self._read_buffer.data[self._f_curr_state_start_pos + 1]
-
-            self._f_fin = (first_byte >> 7) & 1
-            self._f_rsv1 = (first_byte >> 6) & 1
-            self._f_rsv2 = (first_byte >> 5) & 1
-            self._f_rsv3 = (first_byte >> 4) & 1
-            self._f_msg_type = <WSMsgType>(first_byte & 0xF)
-            if self._f_msg_type not in (
-                    WSMsgType.TEXT,
-                    WSMsgType.BINARY,
-                    WSMsgType.PING,
-                    WSMsgType.PONG,
-                    WSMsgType.CLOSE,
-                    WSMsgType.CONTINUATION):
+            payload_length = ntohs((<uint16_t*>&data[pos])[0])
+            if payload_length < 126:
                 raise WSProtocolError(
                     WSCloseCode.PROTOCOL_ERROR,
-                    f"Received frame with invalid opcode={self._f_msg_type:#x}",
+                    "Received frame with invalid 16-bit payload len",
                 )
-
-            if self._f_msg_type > 0x7 and not self._f_fin:
+            pos += 2
+        elif payload_length_flag > 126:
+            if data_end - pos < 8:
+                return None
+            host_len_64 = be64toh((<uint64_t*>&data[pos])[0])
+            if host_len_64 >> 63:
+                # RFC forbids setting the most significant bit
                 raise WSProtocolError(
                     WSCloseCode.PROTOCOL_ERROR,
-                    "Received fragmented control frame",
+                    "Received frame with invalid 64-bit payload length",
                 )
+            payload_length = host_len_64
 
-            self._f_has_mask = (second_byte >> 7) & 1
-            if self.is_client_side and self._f_has_mask:
+            if payload_length < 65536:
                 raise WSProtocolError(
                     WSCloseCode.PROTOCOL_ERROR,
-                    "Received masked frame from server, RFC 6455 section 5.1 forbids this",
+                    "Received frame with invalid 64-bit payload length",
                 )
-            elif not self.is_client_side and not self._f_has_mask:
-                raise WSProtocolError(
-                    WSCloseCode.PROTOCOL_ERROR,
-                    "Received un-masked frame from client, RFC 6455 section 5.1 forbids this",
-                )
+            pos += 8
+        else:
+            payload_length = payload_length_flag
 
-            self._f_payload_length_flag = second_byte & 0x7F
+        if (payload_length > self._max_frame_size and
+                msg_type not in (WSMsgType.PING, WSMsgType.PONG, WSMsgType.CLOSE)):
+            raise WSProtocolError(
+                WSCloseCode.MESSAGE_TOO_BIG,
+                f"Received frame with payload size exceeding max allowed size, "
+                f"{payload_length} > {self._max_frame_size}")
 
-            if (self._f_msg_type in (WSMsgType.PING, WSMsgType.PONG, WSMsgType.CLOSE)
-                    and self._f_payload_length_flag > 125):
-                raise WSProtocolError(
-                    WSCloseCode.PROTOCOL_ERROR,
-                    f"Received control frame with payload size > 125 bytes, opcode={self._f_msg_type:#x}",
-                )
+        if has_mask:
+            if data_end - pos < 4:
+                return None
+            mask = (<uint32_t*>&data[pos])[0]
+            pos += 4
 
-            self._f_curr_state_start_pos += 2
-            self._state = WSParserState.READ_PAYLOAD_LENGTH
+        # Check if we have not yet received the whole payload
+        if data_end - pos < payload_length:
+            return None
 
-        # read payload length
-        if self._state == WSParserState.READ_PAYLOAD_LENGTH:
-            if self._f_payload_length_flag == 126:
-                if self._f_new_data_start_pos - self._f_curr_state_start_pos < 2:
-                    return None
-                self._f_payload_length = ntohs((<uint16_t*>&self._read_buffer.data[self._f_curr_state_start_pos])[0])
-                if self._f_payload_length < 126:
-                    raise WSProtocolError(
-                        WSCloseCode.PROTOCOL_ERROR,
-                        "Received frame with invalid 16-bit payload len",
-                    )
-                self._f_curr_state_start_pos += 2
-            elif self._f_payload_length_flag > 126:
-                if self._f_new_data_start_pos - self._f_curr_state_start_pos < 8:
-                    return None
-                host_len_64 = be64toh((<uint64_t*>&self._read_buffer.data[self._f_curr_state_start_pos])[0])
-                if host_len_64 >> 63:
-                    # RFC forbids setting the most significant bit
-                    raise WSProtocolError(
-                        WSCloseCode.PROTOCOL_ERROR,
-                        "Received frame with invalid 64-bit payload length",
-                    )
-                self._f_payload_length = host_len_64
+        if has_mask:
+            _mask_payload(<uint8_t*>data + pos, payload_length, mask, <uint8_t*>data + pos)
 
-                if self._f_payload_length < 65536:
-                    raise WSProtocolError(
-                        WSCloseCode.PROTOCOL_ERROR,
-                        "Received frame with invalid 64-bit payload length",
-                    )
-                self._f_curr_state_start_pos += 8
+        frame = <WSFrame>WSFrame.__new__(WSFrame)
+        frame.payload_ptr = data + pos
+        frame.payload_size = payload_length
+        frame.tail_size = data_end - (pos + payload_length)
+        frame.msg_type = msg_type
+        frame.fin = fin
+        frame.rsv1 = (first_byte >> 6) & 1
+        frame.rsv2 = (first_byte >> 5) & 1
+        frame.rsv3 = (first_byte >> 4) & 1
+        frame.last_in_buffer = 0
+
+        self._f_curr_frame_start_pos = pos + payload_length
+
+        if cython.unlikely(frame.msg_type == WSMsgType.CLOSE):
+            close_code = frame.get_close_code()
+            if close_code < 3000 and close_code not in _ALLOWED_CLOSE_CODES:
+                raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
+                                     f"Received CLOSE with invalid close code: {frame.get_close_code()}")
+
+            if frame.payload_size == 1:
+                raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
+                                     f"Received CLOSE with invalid close code size: {frame.fin} {frame.msg_type} {frame.get_payload_as_bytes()}")
+
+            recv = <WSCloseInfo>WSCloseInfo.__new__(WSCloseInfo)
+            recv.code = close_code
+            try:
+                recv.reason = frame.get_close_reason()
+            except UnicodeDecodeError:
+                raise WSProtocolError(WSCloseCode.INVALID_TEXT,
+                                      f"Received CLOSE with invalid UTF-8 reason")
+
+            if self.transport.close_handshake is None:
+                self.transport.close_handshake = <WSCloseHandshake>WSCloseHandshake.__new__(WSCloseHandshake)
+                self.transport.close_handshake.recv = recv
+                self.transport.close_handshake.sent = None
+                self.transport.close_handshake.recv_then_sent = True
+            elif self.transport.close_handshake.recv is None:
+                self.transport.close_handshake.recv = recv
             else:
-                self._f_payload_length = self._f_payload_length_flag
+                raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
+                                      f"Received CLOSE for the second time: {frame.get_close_code()}")
 
-            if self._f_has_mask:
-                self._state = WSParserState.READ_PAYLOAD_MASK
-            else:
-                self._f_payload_start_pos = self._f_curr_state_start_pos
-                self._state = WSParserState.READ_PAYLOAD
-
-            if (self._f_payload_length > self._max_frame_size and
-                    self._f_msg_type not in (WSMsgType.PING, WSMsgType.PONG, WSMsgType.CLOSE)):
-                raise WSProtocolError(
-                    WSCloseCode.MESSAGE_TOO_BIG,
-                    f"Received frame with payload size exceeding max allowed size, "
-                    f"{self._f_payload_length} > {self._max_frame_size}")
-
-        # read payload mask
-        if self._state == WSParserState.READ_PAYLOAD_MASK:
-            if self._f_new_data_start_pos - self._f_curr_state_start_pos < 4:
-                return None
-
-            self._f_mask = (<uint32_t*>&self._read_buffer.data[self._f_curr_state_start_pos])[0]
-            self._f_curr_state_start_pos += 4
-            self._f_payload_start_pos = self._f_curr_state_start_pos
-            self._state = WSParserState.READ_PAYLOAD
-
-        if self._state == WSParserState.READ_PAYLOAD:
-            # Check if we have not yet received the whole payload
-            if self._f_new_data_start_pos - self._f_payload_start_pos < self._f_payload_length:
-                return None
-
-            if self._f_has_mask:
-                _mask_payload(<uint8_t*>self._read_buffer.data + self._f_payload_start_pos,
-                              self._f_payload_length,
-                              self._f_mask,
-                              <uint8_t*>self._read_buffer.data + self._f_payload_start_pos
-                              )
-
-            frame = <WSFrame>WSFrame.__new__(WSFrame)
-            frame._payload_obj = None
-            frame.payload_ptr = self._read_buffer.data + self._f_payload_start_pos
-            frame.payload_size = self._f_payload_length
-            frame.tail_size = self._f_new_data_start_pos - (self._f_curr_state_start_pos + self._f_payload_length)
-            frame.msg_type = self._f_msg_type
-            frame.fin = self._f_fin
-            frame.rsv1 = self._f_rsv1
-            frame.rsv2 = self._f_rsv2
-            frame.rsv3 = self._f_rsv3
-            frame.last_in_buffer = 0
-
-            self._f_curr_state_start_pos += self._f_payload_length
-            self._f_curr_frame_start_pos = self._f_curr_state_start_pos
-            self._state = WSParserState.READ_HEADER
-
-            if cython.unlikely(frame.msg_type == WSMsgType.CLOSE):
-                close_code = frame.get_close_code()
-                if close_code < 3000 and close_code not in _ALLOWED_CLOSE_CODES:
-                    raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
-                                         f"Received CLOSE with invalid close code: {frame.get_close_code()}")
-
-                if frame.payload_size == 1:
-                    raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
-                                         f"Received CLOSE with invalid close code size: {frame.fin} {frame.msg_type} {frame.get_payload_as_bytes()}")
-
-                recv = <WSCloseInfo>WSCloseInfo.__new__(WSCloseInfo)
-                recv.code = close_code
-                try:
-                    recv.reason = frame.get_close_reason()
-                except UnicodeDecodeError:
-                    raise WSProtocolError(WSCloseCode.INVALID_TEXT,
-                                          f"Received CLOSE with invalid UTF-8 reason")
-
-                if self.transport.close_handshake is None:
-                    self.transport.close_handshake = <WSCloseHandshake>WSCloseHandshake.__new__(WSCloseHandshake)
-                    self.transport.close_handshake.recv = recv
-                    self.transport.close_handshake.sent = None
-                    self.transport.close_handshake.recv_then_sent = True
-                elif self.transport.close_handshake.recv is None:
-                    self.transport.close_handshake.recv = recv
-                else:
-                    raise WSProtocolError(WSCloseCode.PROTOCOL_ERROR,
-                                          f"Received CLOSE for the second time: {frame.get_close_code()}")
-
-            return frame
-
-        assert False, "we should never reach this state"
+        return frame
 
     cdef inline NoResult _invoke_on_ws_connected(self) except NoResult.EXC:
         cdef:
@@ -2102,8 +2066,6 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
                     self._f_new_data_start_pos - self._f_curr_frame_start_pos)
 
             self._f_new_data_start_pos -= self._f_curr_frame_start_pos
-            self._f_curr_state_start_pos -= self._f_curr_frame_start_pos
-            self._f_payload_start_pos -= self._f_curr_frame_start_pos
             self._f_curr_frame_start_pos = 0
         return NoResult.SUCCESS
 

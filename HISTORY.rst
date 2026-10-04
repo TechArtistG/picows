@@ -38,6 +38,9 @@ Unreleased
   (excluding the syscall) 1.66 → 1.02 us on TCP and 1.21 → 0.90 us on TLS.
 * The receive loop enters one ``try`` block per read instead of one per frame (Cython saves and restores the
   thread's exception state on every ``try``). Measured parse+dispatch 100.4 → 92.1 ns/frame at 64 KB reads.
+* The frame parser keeps the header in local variables and re-parses it from the frame start on each call
+  instead of storing a resumable state machine in the protocol object (headers are at most 14 bytes).
+  Simpler code, measured parse+dispatch -5.8 ns/frame (faster in 14 of 15 paired runs).
 
 2.3.1 (2026-09-15)
 ------------------
