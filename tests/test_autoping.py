@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 
 import async_timeout
 import pytest
@@ -347,3 +349,54 @@ async def test_roundtrip_latency_disconnect(with_auto_ping):
                                 auto_ping_reply_timeout=0.5) as client:
                 with pytest.raises(ConnectionResetError):
                     await client.transport.measure_roundtrip_time(5)
+
+
+async def test_auto_pong_sent_after_frames_of_the_same_read():
+    # PING(a) + PING(b) + TEXT arrive in one read. The TEXT frame must be delivered without
+    # waiting for the PONG write, so the client's reply to TEXT is on the wire before the PONG.
+    # Only the last PING of the read is answered (RFC 6455 5.5.3).
+    received = []
+    done = asyncio.get_running_loop().create_future()
+
+    async def read_frame(reader):
+        b0, b1 = await reader.readexactly(2)
+        length = b1 & 0x7F
+        key = await reader.readexactly(4)
+        payload = bytes(c ^ key[i % 4] for i, c in enumerate(await reader.readexactly(length)))
+        return picows.WSMsgType(b0 & 0x0F), payload
+
+    async def handle(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        ws_key = [line.split(b":", 1)[1].strip() for line in request.split(b"\r\n")
+                  if line.lower().startswith(b"sec-websocket-key:")][0]
+        accept = base64.b64encode(hashlib.sha1(ws_key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        writer.write(b"\x89\x01a" + b"\x89\x01b" + b"\x81\x04data")
+        received.append(await read_frame(reader))
+        received.append(await read_frame(reader))
+        try:
+            async with async_timeout.timeout(0.2):
+                received.append(await read_frame(reader))
+        except asyncio.TimeoutError:
+            pass
+        done.set_result(None)
+        writer.close()
+
+    class ClientListener(picows.WSListener):
+        def on_ws_frame(self, transport: picows.WSTransport, frame: picows.WSFrame):
+            if frame.msg_type == picows.WSMsgType.TEXT:
+                transport.send(picows.WSMsgType.TEXT, b"reply")
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with async_timeout.timeout(TIMEOUT):
+            transport, _ = await picows.ws_connect(ClientListener, f"ws://127.0.0.1:{port}/", enable_auto_pong=True)
+            await done
+            transport.disconnect()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert received == [(picows.WSMsgType.TEXT, b"reply"), (picows.WSMsgType.PONG, b"b")]

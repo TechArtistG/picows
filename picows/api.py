@@ -136,6 +136,8 @@ async def ws_connect(ws_listener_factory: WSListenerFactory, # type: ignore [no-
         * PING_PERIODICALLY - send ping at regular intervals regardless of incoming data.
     :param enable_auto_pong:
         If enabled, picows will automatically reply to incoming PING frames.
+        The PONG is sent after all frames of the current read have been delivered,
+        and only the last PING of a read is answered.
     :param max_frame_size:
         * Maximum allowed frame size. Disconnect will be initiated if client receives a frame that is bigger than max size.
     :param extra_headers:
@@ -387,6 +389,8 @@ async def ws_create_server(ws_listener_factory: WSServerListenerFactory,        
         * PING_PERIODICALLY - send ping at regular intervals regardless of incoming data.
     :param enable_auto_pong:
         If enabled, picows will automatically reply to incoming PING frames.
+        The PONG is sent after all frames of the current read have been delivered,
+        and only the last PING of a read is answered.
     :param max_frame_size:
         * Maximum allowed frame size. Disconnect will be initiated if the server side receives a frame that is bigger than the max size.
     :param read_buffer_init_size:

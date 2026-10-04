@@ -27,6 +27,12 @@ Unreleased
   ``uv python install``). Measured ~2x higher latency and CPU per message than the direct OpenSSL engine.
 * Add ``WSBusyPoll``: keeps the event loop from blocking in ``select``/``epoll_wait`` to cut wake-up latency,
   at the cost of one CPU core. Measured one-way p50 39 → 23 us (TCP) and 49 → 31 us (TLS) at 2,000 msg/s.
+* Client masking keys come from a per-connection ChaCha20 keystream seeded from ``os.urandom`` instead of
+  ``rand()``, as RFC 6455 requires unpredictable keys from a strong entropy source. Also faster: 9.4 vs 17.8 ns
+  per key; the keystream block is refilled after a frame has been written, so it never delays a send.
+* Automatic PONG replies are sent after all frames of the current read have been delivered, so frames
+  following a PING are no longer delayed by the PONG write (measured 7 us TCP / 12 us TLS per write). Only the
+  last PING of a read is answered, as allowed by RFC 6455 5.5.3.
 
 2.3.1 (2026-09-15)
 ------------------

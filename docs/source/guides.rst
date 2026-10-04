@@ -213,6 +213,10 @@ This is controlled by `enable_auto_pong` argument to :any:`ws_connect`
 and :any:`ws_create_server`. If disabled, PING messages must be handled
 manually from :any:`on_ws_frame`.
 
+The PONG is sent after all frames received in the same read have been delivered to
+:any:`on_ws_frame`, so frames that follow a PING aren't delayed by the PONG write.
+If several PINGs arrive in one read, only the last one is answered, as allowed by RFC 6455.
+
 .. code-block:: python
 
     class ClientListener(picows.WSListener):
