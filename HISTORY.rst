@@ -17,6 +17,11 @@ Unreleased
   an unreachable address family (typically broken IPv6) stalled connecting for several seconds.
 * Fix ``PING_PERIODICALLY`` sending pings every ``auto_ping_idle_timeout + auto_ping_reply_timeout``
   seconds instead of every ``auto_ping_idle_timeout`` seconds.
+* ``WSProtocol`` derives from ``aiofastnet.Protocol``, so aiofastnet transports hand received data to picows
+  through C calls instead of Python ``get_buffer``/``buffer_updated`` calls and a memoryview per read.
+  picows is now compiled against aiofastnet's ``.pxd`` files: aiofastnet is a build-time and hard import-time
+  dependency, pinned to ``>= 1.2.0, < 1.3`` because the extension depends on its C object layout and vtables.
+  The empty ``aiofastnet`` extra is removed.
 
 2.3.1 (2026-09-15)
 ------------------

@@ -6,6 +6,8 @@ from logging import Logger, LoggerAdapter, getLogger
 from ssl import SSLContext
 from typing import Any, Awaitable, Callable, Optional, Union, cast, TYPE_CHECKING
 
+import aiofastnet
+
 from .proxy import (ConnectedTransport, WSSocketFactory,
                     connect_through_optional_proxy)
 from .common import (WSHeadersLike, WSUpgradeRequest, WSUpgradeResponse,
@@ -26,13 +28,6 @@ else:
     _WSLoggerAdapter = LoggerAdapter
 
 WSLoggerLike = Union[str, Logger, _WSLoggerAdapter, None]
-
-_HAS_AIOFASTNET = False
-try:
-    import aiofastnet
-    _HAS_AIOFASTNET = True
-except ImportError:
-    pass
 
 
 def _maybe_handle_redirect(exc: WSHandshakeError, old_parsed_url: WSParsedURL, max_redirects: int) -> WSParsedURL:
@@ -174,7 +169,7 @@ async def ws_connect(ws_listener_factory: WSListenerFactory, # type: ignore [no-
     :param use_aiofastnet:
         Use **aiofastnet** package to create client and server connections
         instead of ``loop.create_server``, ``loop.create_connection`` native method.
-        **picows** will use **aiofastnet** by default if it is installed.
+        **picows** uses **aiofastnet** by default.
         You can override default behavior by using this argument.
 
         When **aiofastnet** is used, ``happy_eyeballs_delay`` defaults to 0.25
@@ -194,10 +189,9 @@ async def ws_connect(ws_listener_factory: WSListenerFactory, # type: ignore [no-
     assert "all_errors" not in kwargs, "explicit 'all_errors' argument for loop.create_connection is not supported"
     assert auto_ping_strategy in (WSAutoPingStrategy.PING_WHEN_IDLE, WSAutoPingStrategy.PING_PERIODICALLY), \
         "invalid value of auto_ping_strategy parameter"
-    assert _HAS_AIOFASTNET or use_aiofastnet != True, "use_aiofastnet==True, but aiofastnet package is not installed"
 
     if use_aiofastnet is None:
-        use_aiofastnet = _HAS_AIOFASTNET
+        use_aiofastnet = True
 
     if use_aiofastnet:
         # uvloop's create_connection doesn't accept happy_eyeballs_delay,
@@ -402,16 +396,15 @@ async def ws_create_server(ws_listener_factory: WSServerListenerFactory,        
     :param use_aiofastnet:
         Use **aiofastnet** package to create client and server connections
         instead of ``loop.create_server``, ``loop.create_connection`` native method.
-        **picows** will use **aiofastnet** by default if it is installed.
+        **picows** uses **aiofastnet** by default.
         You can override default behavior by using this argument.
     :return: `asyncio.Server <https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.Server>`_ object
     """
 
     assert auto_ping_strategy in (WSAutoPingStrategy.PING_WHEN_IDLE, WSAutoPingStrategy.PING_PERIODICALLY), "invalid value of auto_ping_strategy parameter"
-    assert _HAS_AIOFASTNET or use_aiofastnet != True, "use_aiofastnet==True, but aiofastnet package is not installed"
 
     if use_aiofastnet is None:
-        use_aiofastnet = _HAS_AIOFASTNET
+        use_aiofastnet = True
 
     # May sure people who are passing old argument are not going to get an exception
     kwargs.pop('zero_copy_unsafe_ssl_write', None)

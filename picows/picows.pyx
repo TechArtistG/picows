@@ -22,6 +22,9 @@ from cpython.pythread cimport PyThread_get_thread_ident
 from libc.string cimport memmove, memcpy
 from libc.stdlib cimport rand
 
+from aiofastnet.transport cimport Protocol as AiofnProtocol, Transport as AiofnTransport
+from aiofastnet.utils cimport NoResult as AiofnNoResult
+
 from .common import (PICOWS_DEBUG_LL, WSUpgradeRequest, WSUpgradeResponse,
                      WSUpgradeResponseWithListener,
                      WSHandshakeError, WSInvalidMessageError, WSInvalidStatusError,
@@ -136,14 +139,6 @@ cdef inline NoResult _unpack_buffer(object buffer, char** ptr_out,
     # * Preferably not to use nogil functions, because other threads may try to modify buffer content.
     PyBuffer_Release(&pybuf)
     return NoResult.SUCCESS
-
-
-cdef _is_aiofn_transport(transport):
-    try:
-        import aiofastnet
-        return isinstance(transport, aiofastnet.Transport)
-    except:
-        return False
 
 
 cdef class WSCloseInfo:
@@ -682,7 +677,7 @@ cdef class WSTransport:
         self._loop = loop
         self._logger = logger
         self._log_debug_enabled = self._logger.isEnabledFor(_DEBUG_LL)
-        self._is_aiofn_transport = _is_aiofn_transport(underlying_transport)
+        self._is_aiofn_transport = isinstance(underlying_transport, AiofnTransport)
         self._tr_get_write_buffer_size = underlying_transport.get_write_buffer_size
         self._tr_write = underlying_transport.write_nocheck \
             if self._is_aiofn_transport else underlying_transport.write
@@ -1204,7 +1199,10 @@ cdef class WSTransport:
 #     )
 
 
-cdef class WSProtocolBase:
+# Deriving from aiofastnet.Protocol lets aiofastnet transports call get_buffer_c
+# and buffer_updated through the C vtable: no Python method calls and no memoryview
+# allocation per read. asyncio and uvloop transports keep using the Python methods.
+cdef class WSProtocolBase(AiofnProtocol):
     pass
 
 
@@ -1427,7 +1425,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
             except _NotImplemented:
                 self._logger.warning("Protocol writing resume requested, crossed writing buffer low-watermark")
 
-    def is_buffered_protocol(self):
+    cpdef is_buffered_protocol(self):
         return True
 
     # def data_received(self, data):
@@ -1445,25 +1443,33 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
     #
     #     self._process_new_data()
 
-    def get_buffer(self, Py_ssize_t size_hint):
-        # size_hint is un-reliable, uvloop provides a fixed value of 65536
+    cdef AiofnNoResult get_buffer_c(self, Py_ssize_t hint, char** buf_ptr,
+                                    Py_ssize_t* buf_len) except AiofnNoResult.EXC:
+        # hint is un-reliable, uvloop provides a fixed value of 65536
         # and asyncio just always pass -1
         # Therefore, ignore it and just implement exponential buffer grow
         # after reading data when buffer utilization hits a thresholds.
 
         if cython.unlikely(self._log_debug_enabled):
             self._logger.log(_DEBUG_LL, "get_buffer(%d), provide=%d, total=%d, cap=%d",
-                             size_hint,
+                             hint,
                              self._read_buffer.size - self._f_new_data_start_pos,
                              self._read_buffer.size,
                              self._read_buffer.capacity)
 
-        return PyMemoryView_FromMemory(
-            self._read_buffer.data + self._f_new_data_start_pos,
-            self._read_buffer.size - self._f_new_data_start_pos,
-            PyBUF_WRITE)
+        buf_ptr[0] = self._read_buffer.data + self._f_new_data_start_pos
+        buf_len[0] = self._read_buffer.size - self._f_new_data_start_pos
+        return AiofnNoResult.OK
 
-    def buffer_updated(self, Py_ssize_t nbytes):
+    cpdef get_buffer(self, Py_ssize_t hint):
+        cdef:
+            char* buf_ptr
+            Py_ssize_t buf_len
+
+        self.get_buffer_c(hint, &buf_ptr, &buf_len)
+        return PyMemoryView_FromMemory(buf_ptr, buf_len, PyBUF_WRITE)
+
+    cpdef buffer_updated(self, Py_ssize_t nbytes):
         if cython.unlikely(self._log_debug_enabled):
             self._logger.log(_DEBUG_LL, "buffer_updated(%d), write_pos %d -> %d", nbytes,
                              self._f_new_data_start_pos, self._f_new_data_start_pos + nbytes)
