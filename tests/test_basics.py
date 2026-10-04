@@ -3,13 +3,15 @@ import base64
 import logging
 import os
 
+import aiofastnet
 import picows
 import pytest
 import async_timeout
 
 from picows import WSCloseCode
 from tests.utils import (TIMEOUT, AsyncClient, WSServer, WSClient, SomeException)
-from tests.fixtures import multiloop_event_loop_policy
+from tests.fixtures import (multiloop_event_loop_policy, create_server_ssl_context,
+                            create_client_ssl_context)
 
 event_loop_policy = multiloop_event_loop_policy()
 
@@ -317,3 +319,28 @@ async def test_send_after_abort(use_aiofastnet, ssl_context):
             await asyncio.sleep(0.05)
             client.transport.send(picows.WSMsgType.BINARY, b"halo")
             client.transport.send_reuse_external_bytearray(picows.WSMsgType.BINARY, ba, 16)
+
+
+@pytest.mark.skipif(aiofastnet.OPENSSL_DYN_LIBS is None,
+                    reason="Python links OpenSSL statically, aiofastnet direct TLS engine is unavailable")
+async def test_warn_once_when_aiofastnet_uses_tls_fallback_engine(caplog, monkeypatch):
+    monkeypatch.setattr(picows.picows, "_tls_fallback_warned", False)
+
+    def fallback_warnings():
+        return [r for r in caplog.records if "fallback TLS engine" in r.getMessage()]
+
+    fallback_ssl_context = create_client_ssl_context()
+    fallback_ssl_context._aiofastnet_force_fallback_ssl = True
+
+    with caplog.at_level(logging.WARNING, logger="picows"):
+        async with WSServer(ssl=create_server_ssl_context()) as server:
+            async with WSClient(server, ssl_context=create_client_ssl_context()):
+                pass
+            assert fallback_warnings() == []
+
+            for _ in range(2):
+                async with WSClient(server, ssl_context=fallback_ssl_context):
+                    pass
+
+    assert len(fallback_warnings()) == 1
+    assert fallback_warnings()[0].levelno == logging.WARNING

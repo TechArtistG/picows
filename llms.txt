@@ -140,6 +140,8 @@ if __name__ == "__main__":
   `uv python install`) make aiofastnet fall back to the much slower stdlib `ssl.MemoryBIO` engine. Check with
   `python -c "import aiofastnet; print(aiofastnet.OPENSSL_DYN_LIBS)"` (`None` means fallback). See the
   "TLS performance: OpenSSL linkage and kernel TLS" guide.
+- For lowest receive latency, `picows.WSBusyPoll().start()` keeps the event loop from blocking in
+  `select`/`epoll_wait` (one per event loop; it keeps one CPU core at 100%). See the "Busy polling" guide.
 
 ## Project links
 

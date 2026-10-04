@@ -31,6 +31,8 @@ from .api import (
     ws_create_server,
 )
 
+from .busy_poll import WSBusyPoll
+
 __all__ = [
     'WSError',
     'WSHandshakeError',
@@ -53,6 +55,7 @@ __all__ = [
     'WSListener',
     'ws_connect',
     'ws_create_server',
+    'WSBusyPoll',
 ]
 
 from .version import __author__, __version__

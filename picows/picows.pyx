@@ -4,6 +4,8 @@ import binascii
 import logging
 import os
 import socket
+import ssl
+import threading
 from http import HTTPStatus
 from base64 import b64encode, b64decode
 from hashlib import sha1
@@ -42,6 +44,31 @@ cdef:
     bytes _HTTP_TOKEN_SPECIALS = b"!#$%&'*+-.^_`|~"
     Py_ssize_t _HTTP_MAX_NUM_HEADERS = 128
     object _DEBUG_LL = PICOWS_DEBUG_LL
+
+
+# Warn only once per process about aiofastnet using the stdlib ssl fallback engine.
+# Regular module global (not cdef), so tests can reset it. The lock makes "once" hold
+# when loops in several threads open their first fallback connections concurrently
+# (free-threaded Python); it is only taken on the fallback path.
+_tls_fallback_warned = False
+cdef object _tls_fallback_lock = threading.Lock()
+
+
+cdef _warn_if_tls_fallback(object logger, object ssl_object):
+    # aiofastnet drives OpenSSL directly only when Python links it dynamically. Otherwise it
+    # uses the stdlib ssl.MemoryBIO/SSLObject engine, which is much slower.
+    global _tls_fallback_warned
+    if _tls_fallback_warned or not isinstance(ssl_object, ssl.SSLObject):
+        return
+    with _tls_fallback_lock:
+        if _tls_fallback_warned:
+            return
+        _tls_fallback_warned = True
+    logger.warning(
+        "aiofastnet is using the slow stdlib ssl fallback TLS engine, probably because this Python links "
+        "OpenSSL statically (e.g. an interpreter installed by 'uv python install'). TLS latency and CPU "
+        "usage are significantly worse. See 'TLS performance: OpenSSL linkage and kernel TLS' in the "
+        "picows documentation. This warning is logged once per process.")
 
 
 class _NotImplemented(Exception):
@@ -688,7 +715,10 @@ cdef class WSTransport:
         self.response = None
         self.close_handshake = None
         self.is_client_side = is_client_side
-        self.is_secure = underlying_transport.get_extra_info('ssl_object') is not None
+        ssl_object = underlying_transport.get_extra_info('ssl_object')
+        self.is_secure = ssl_object is not None
+        if self._is_aiofn_transport:
+            _warn_if_tls_fallback(logger, ssl_object)
         self.is_close_frame_sent = False
         self.is_disconnected = False
         self.auto_ping_expect_pong = False

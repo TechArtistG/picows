@@ -22,6 +22,11 @@ Unreleased
   picows is now compiled against aiofastnet's ``.pxd`` files: aiofastnet is a build-time and hard import-time
   dependency, pinned to ``>= 1.2.0, < 1.3`` because the extension depends on its C object layout and vtables.
   The empty ``aiofastnet`` extra is removed.
+* Log a warning once per process when aiofastnet uses its slow stdlib ``ssl`` fallback engine for a TLS
+  connection, which happens when Python links OpenSSL statically (e.g. interpreters installed by
+  ``uv python install``). Measured ~2x higher latency and CPU per message than the direct OpenSSL engine.
+* Add ``WSBusyPoll``: keeps the event loop from blocking in ``select``/``epoll_wait`` to cut wake-up latency,
+  at the cost of one CPU core. Measured one-way p50 39 → 23 us (TCP) and 49 → 31 us (TLS) at 2,000 msg/s.
 
 2.3.1 (2026-09-15)
 ------------------

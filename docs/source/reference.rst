@@ -277,6 +277,9 @@ Classes
         :param rsv3: third reserved bit in websocket frame.
             Protocol extensions can use this flag.
 
+.. autoclass:: WSBusyPoll
+    :members:
+
 Enums
 -----
 

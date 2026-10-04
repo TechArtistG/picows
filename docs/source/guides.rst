@@ -443,6 +443,9 @@ If you manage environments with ``uv``, you can keep using it with a system inte
 ``uv venv --python /usr/bin/python3.12``, or set ``UV_PYTHON_PREFERENCE=only-system``.
 Reinstall **picows** in the new environment, since it is compiled per interpreter.
 
+If aiofastnet uses the fallback engine, **picows** logs a warning once per process when the first
+such ``wss://`` connection is established.
+
 Kernel TLS
 ^^^^^^^^^^
 
@@ -474,6 +477,45 @@ aiofastnet logs the result for each connection at DEBUG level:
     import logging
     logging.getLogger("aiofastnet").setLevel(logging.DEBUG)
     # ... "KTLS SEND: enabled", "KTLS RECV: disabled"
+
+Busy polling
+------------
+
+When no data is ready, the event loop thread blocks in ``select``/``epoll_wait`` and
+the OS has to wake it up when a packet arrives. That wake-up adds latency to every
+message that arrives while the loop is idle. :any:`WSBusyPoll` keeps the event loop
+busy so it never blocks, and polls sockets with a zero timeout instead:
+
+.. code-block:: python
+
+    import picows
+
+    async def main():
+        busy_poll = picows.WSBusyPoll()
+        busy_poll.start()
+        try:
+            transport, listener = await picows.ws_connect(Listener, "wss://example.com/ws")
+            await transport.wait_disconnected()
+        finally:
+            busy_poll.stop()
+
+In one measurement on Linux with ``uvloop``, at 2,000 messages/s with the client and server
+in separate processes over loopback, busy polling reduced client one-way latency:
+
++-----------+---------------------+---------------------+
+|           | p50, idle → busy    | p99, idle → busy    |
++===========+=====================+=====================+
+| TCP       | 39 → 23 us          | 148 → 62 us         |
++-----------+---------------------+---------------------+
+| TLS       | 49 → 31 us          | 184 → 82 us         |
++-----------+---------------------+---------------------+
+
+The cost is one CPU core kept at 100% for as long as busy polling runs:
+
+* Use one :any:`WSBusyPoll` per event loop; it serves all connections on that loop.
+* Busy polling only helps when the loop has a core to itself. Pin the process or thread to a dedicated core
+  (``os.sched_setaffinity``) and don't run more busy-polling loops than available cores.
+* Timers, tasks and other callbacks keep working normally while busy polling runs.
 
 Serving a health check alongside a WebSocket endpoint
 ------------------------------------------------------
