@@ -176,6 +176,12 @@ async def ws_connect(ws_listener_factory: WSListenerFactory, # type: ignore [no-
         instead of ``loop.create_server``, ``loop.create_connection`` native method.
         **picows** will use **aiofastnet** by default if it is installed.
         You can override default behavior by using this argument.
+
+        When **aiofastnet** is used, ``happy_eyeballs_delay`` defaults to 0.25
+        seconds (RFC 8305), so an unreachable address family (typically
+        broken IPv6) does not stall the connection until the OS connect
+        timeout. Pass ``happy_eyeballs_delay=None`` explicitly to try
+        addresses strictly one by one.
     :return:
         :any:`WSTransport` object and a user handler returned by
         `ws_listener_factory()`, or by
@@ -192,6 +198,11 @@ async def ws_connect(ws_listener_factory: WSListenerFactory, # type: ignore [no-
 
     if use_aiofastnet is None:
         use_aiofastnet = _HAS_AIOFASTNET
+
+    if use_aiofastnet:
+        # uvloop's create_connection doesn't accept happy_eyeballs_delay,
+        # therefore only default it for aiofastnet, which supports it on any loop.
+        kwargs.setdefault("happy_eyeballs_delay", 0.25)
 
     # May sure people who are passing old argument are not going to get an exception
     kwargs.pop('zero_copy_unsafe_ssl_write', None)
