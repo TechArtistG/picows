@@ -403,6 +403,78 @@ control connection establishment behavior), use ``socket_factory``:
     **picows** already enables `TCP_NODELAY` and, when available on the
     platform, `TCP_QUICKACK` to reduce latency by default.
 
+TLS performance: OpenSSL linkage and kernel TLS
+-----------------------------------------------
+
+For ``wss://`` connections, `aiofastnet <https://github.com/tarasko/aiofastnet>`_
+(the transport layer used by **picows**) drives OpenSSL directly from C. It can only do this
+when Python's ``ssl`` module links OpenSSL as a shared library (``libssl.so``/``libcrypto.so``).
+If OpenSSL is statically linked into the interpreter, aiofastnet silently falls back to the
+standard library ``ssl.MemoryBIO``/``SSLObject`` engine, which is considerably slower.
+
+In one measurement on Linux with ``uvloop``, at 2,000 TLS messages/s of ~600 bytes each and
+with the client and server in separate processes over loopback, the fallback engine roughly doubled
+client latency and CPU usage:
+
++---------------------------------+--------------------+-----------------+--------------------+
+| TLS engine                      | one-way p50        | one-way p99     | client CPU/message |
++=================================+====================+=================+====================+
+| direct (shared OpenSSL)         | 46-49 us           | 175-203 us      | 24-26 us           |
++---------------------------------+--------------------+-----------------+--------------------+
+| fallback (static OpenSSL)       | 88-98 us           | 278-319 us      | 51-55 us           |
++---------------------------------+--------------------+-----------------+--------------------+
+
+Check which engine your environment uses:
+
+.. code-block:: bash
+
+    python -c "import aiofastnet; print('direct' if aiofastnet.OPENSSL_DYN_LIBS else 'fallback')"
+
+Typical interpreters:
+
+* Interpreters installed by ``uv python install`` (python-build-standalone) link OpenSSL statically
+  and use the **fallback** engine.
+* Linux distribution packages (e.g. Ubuntu/Debian ``python3``) link the system OpenSSL dynamically
+  and use the **direct** engine. Interpreters built from source against a system OpenSSL
+  (pyenv, deadsnakes, official ``python`` Docker images) normally do as well; verify with the
+  command above.
+
+If you manage environments with ``uv``, you can keep using it with a system interpreter, e.g.
+``uv venv --python /usr/bin/python3.12``, or set ``UV_PYTHON_PREFERENCE=only-system``.
+Reinstall **picows** in the new environment, since it is compiled per interpreter.
+
+Kernel TLS
+^^^^^^^^^^
+
+On Linux, aiofastnet can hand TLS record encryption/decryption to the kernel (kTLS).
+Request it through the SSL context:
+
+.. code-block:: python
+
+    import ssl
+    from picows import ws_connect
+
+    ssl_context = ssl.create_default_context()
+    ssl_context.options |= ssl.OP_ENABLE_KTLS
+
+    transport, listener = await ws_connect(Listener, "wss://example.com/ws", ssl_context=ssl_context)
+
+kTLS is only enabled when all of these hold, otherwise the connection silently uses userspace TLS:
+
+* Python 3.12 or later (``ssl.OP_ENABLE_KTLS`` doesn't exist in earlier versions).
+* aiofastnet uses the **direct** engine (shared OpenSSL, see above).
+* OpenSSL was built with kTLS support (``enable-ktls``). Receive offload for TLS 1.3 requires
+  OpenSSL 3.2 or later; OpenSSL 3.0 only offloads sending for TLS 1.3.
+* The ``tls`` kernel module is loaded (``sudo modprobe tls``) and the kernel is 5.1 or later.
+
+aiofastnet logs the result for each connection at DEBUG level:
+
+.. code-block:: python
+
+    import logging
+    logging.getLogger("aiofastnet").setLevel(logging.DEBUG)
+    # ... "KTLS SEND: enabled", "KTLS RECV: disabled"
+
 Serving a health check alongside a WebSocket endpoint
 ------------------------------------------------------
 

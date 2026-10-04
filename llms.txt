@@ -136,6 +136,10 @@ if __name__ == "__main__":
   `wait_disconnected()` also raises when picows detects a protocol violation.
 - `wait_disconnected()` does not raise merely because the peer initiated disconnect, sent a CLOSE frame with a non-OK
   code, or dropped the connection without sending a CLOSE frame.
+- For `wss://` performance, Python must link OpenSSL dynamically. Statically linked interpreters (e.g. installed by
+  `uv python install`) make aiofastnet fall back to the much slower stdlib `ssl.MemoryBIO` engine. Check with
+  `python -c "import aiofastnet; print(aiofastnet.OPENSSL_DYN_LIBS)"` (`None` means fallback). See the
+  "TLS performance: OpenSSL linkage and kernel TLS" guide.
 
 ## Project links
 
