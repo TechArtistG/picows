@@ -33,6 +33,11 @@ Unreleased
 * Automatic PONG replies are sent after all frames of the current read have been delivered, so frames
   following a PING are no longer delayed by the PONG write (measured 7 us TCP / 12 us TLS per write). Only the
   last PING of a read is answered, as allowed by RFC 6455 5.5.3.
+* Writes to aiofastnet transports go through aiofastnet's C-level ``write_c`` instead of a Python
+  ``get_write_buffer_size()`` call plus a memoryview and a Python ``write`` call. Measured per-send overhead
+  (excluding the syscall) 1.66 → 1.02 us on TCP and 1.21 → 0.90 us on TLS.
+* The receive loop enters one ``try`` block per read instead of one per frame (Cython saves and restores the
+  thread's exception state on every ``try``). Measured parse+dispatch 100.4 → 92.1 ns/frame at 64 KB reads.
 
 2.3.1 (2026-09-15)
 ------------------

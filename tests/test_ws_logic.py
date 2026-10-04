@@ -15,7 +15,7 @@ from multidict import CIMultiDict
 
 import picows
 from picows.api import _resolve_logger
-from tests.utils import WSServer, WSClient, AsyncClient, send_http_request
+from tests.utils import TIMEOUT, WSServer, WSClient, AsyncClient, send_http_request
 from tests.fixtures import use_aiofastnet, ssl_context
 
 
@@ -400,6 +400,45 @@ async def test_invalid_frame_opcode():
             assert frame.close_code == picows.WSCloseCode.PROTOCOL_ERROR
             assert b"Received frame with invalid opcode" in frame.close_message
             await client.transport.wait_disconnected()
+
+
+async def test_frame_before_invalid_frame_in_same_read_is_delivered_after_close():
+    # The parser only delivers a frame after parsing the next one (to set last_in_buffer).
+    # When the next frame is invalid, CLOSE(PROTOCOL_ERROR) is sent first and the already parsed
+    # frame is still delivered as the last one in the buffer.
+    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        request = await reader.readuntil(b"\r\n\r\n")
+        websocket_key = next(line.split(b":", 1)[1].strip() for line in request.split(b"\r\n")
+                             if line.lower().startswith(b"sec-websocket-key:"))
+        accept = base64.b64encode(sha1(websocket_key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+                     b"\x81\x02ok"     # TEXT "ok"
+                     b"\x84\x00")      # invalid opcode 0x4
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    delivered = []
+
+    class ClientListener(picows.WSListener):
+        def on_ws_frame(self, transport: picows.WSTransport, frame: picows.WSFrame):
+            delivered.append((frame.msg_type, frame.get_payload_as_bytes(), frame.last_in_buffer,
+                              transport.is_close_frame_sent))
+
+    server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with async_timeout.timeout(TIMEOUT):
+            transport, _ = await picows.ws_connect(ClientListener, f"ws://127.0.0.1:{port}/")
+            with pytest.raises(picows.WSProtocolError, match="invalid opcode"):
+                await transport.wait_disconnected()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert delivered == [(picows.WSMsgType.TEXT, b"ok", True, True)]
+    assert transport.close_handshake.sent.code == picows.WSCloseCode.PROTOCOL_ERROR
 
 
 async def test_unmasked_frame_from_client():

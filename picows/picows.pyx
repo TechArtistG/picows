@@ -711,8 +711,8 @@ cdef class WSTransport:
         self._log_debug_enabled = self._logger.isEnabledFor(_DEBUG_LL)
         self._is_aiofn_transport = isinstance(underlying_transport, AiofnTransport)
         self._tr_get_write_buffer_size = underlying_transport.get_write_buffer_size
-        self._tr_write = underlying_transport.write_nocheck \
-            if self._is_aiofn_transport else underlying_transport.write
+        # Only used for non-aiofastnet transports, aiofastnet ones are written via write_c
+        self._tr_write = underlying_transport.write
         self._socket = underlying_transport.get_extra_info('socket').fileno()
 
         self.underlying_transport = underlying_transport
@@ -1210,6 +1210,13 @@ cdef class WSTransport:
     cdef NoResult _fast_write(self, char* ptr, Py_ssize_t sz) except NoResult.EXC:
         cdef Py_ssize_t bytes_written
 
+        if self._is_aiofn_transport:
+            # aiofastnet's C-level write sends directly when nothing is queued and copies
+            # whatever can't be sent immediately, for both TCP and TLS. No Python calls or
+            # buffer objects are involved.
+            (<AiofnTransport>self.underlying_transport).write_c(ptr, sz)
+            return NoResult.SUCCESS
+
         # Fast path for TCP protocol when there is not cached data in the transport
         if not self.is_secure and not <Py_ssize_t>self._tr_get_write_buffer_size():
             # Try to send data using system send. Pass copied data to asyncio if we
@@ -1221,15 +1228,8 @@ cdef class WSTransport:
                 self._tr_write(PyBytes_FromStringAndSize(<char*> ptr + bytes_written, sz - bytes_written))
                 return NoResult.SUCCESS
 
-        if self._is_aiofn_transport:
-            # aiofastnet guarantees that the data will be copied if it can't be
-            # sent immediately, we can safely use non-owning memory view to our
-            # buffer
-            self._tr_write(PyMemoryView_FromMemory(ptr, sz, PyBUF_READ))
-            return NoResult.SUCCESS
-        else:
-            self._tr_write(PyBytes_FromStringAndSize(ptr, sz))
-            return NoResult.SUCCESS
+        self._tr_write(PyBytes_FromStringAndSize(ptr, sz))
+        return NoResult.SUCCESS
 
 
 # uvloop and asyncio use different checks to detect BufferedProtocol
@@ -1555,32 +1555,35 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
 
         self._last_data_time = picows_get_monotonic_time()
 
-        cdef WSFrame frame = self._get_next_frame()
-        if frame is None:
-            return NoResult.SUCCESS
+        cdef:
+            WSFrame frame = None
+            WSFrame next_frame
+            bint parsing = True
 
-        # Parsing next frame may cause WSProtocolError.
-        # In such case we do not deliver current frame to user.
-        # Instead, the logic will send CLOSE and close connection.
-        # I don't know if it is a bug or a feature.
-        # Will re-visit this when somebody complain.
-
-        cdef WSFrame next_frame = self._get_next_frame()
-        if next_frame is None:
-            frame.last_in_buffer = 1
-            self._invoke_on_ws_frame(frame)
-            self._shrink_buffer()
-            self._send_pending_pong()
-            return NoResult.SUCCESS
-        else:
-            self._invoke_on_ws_frame(frame)
-
-        while next_frame is not None:
-            frame = next_frame
-            next_frame = self._get_next_frame()
-            if next_frame is None:
+        # One try block per read instead of one per frame: entering a Cython try block saves and
+        # restores the thread's exception state, which cost ~15 ns per frame.
+        #
+        # A frame is delivered only after the next one has been parsed, to set last_in_buffer.
+        # If parsing the next frame fails, CLOSE is sent first and the already parsed frame is
+        # still delivered. Exceptions that escape _invoke_on_ws_frame aren't parser errors and
+        # propagate unchanged.
+        try:
+            frame = self._get_next_frame_impl()
+            while frame is not None:
+                next_frame = self._get_next_frame_impl()
+                if next_frame is None:
+                    frame.last_in_buffer = 1
+                parsing = False
+                self._invoke_on_ws_frame(frame)
+                parsing = True
+                frame = next_frame
+        except BaseException as ex:
+            if not parsing:
+                raise
+            self._handle_parser_error(ex)
+            if frame is not None:
                 frame.last_in_buffer = 1
-            self._invoke_on_ws_frame(frame)
+                self._invoke_on_ws_frame(frame)
 
         self._shrink_buffer()
         self._send_pending_pong()
@@ -1817,19 +1820,17 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
 
         return response
 
-    cdef inline WSFrame _get_next_frame(self):
-        try:
-            return self._get_next_frame_impl()
-        except WSProtocolError as ex:
+    cdef inline NoResult _handle_parser_error(self, ex) except NoResult.EXC:
+        # Called from an except block, so logger.exception() picks up the traceback
+        self._disconnect_exception = ex
+        if isinstance(ex, WSProtocolError):
             self._logger.error("WS parser error: %s, initiate disconnect", ex.args)
-            self._disconnect_exception = ex
             self.transport.send_close(ex.args[0], ex.args[1])
-            self._loop.call_later(_DISCONNECT_AFTER_ERROR_DELAY, self.transport.disconnect)
-        except BaseException as ex:
+        else:
             self._logger.exception("WS parser failure, initiate disconnect")
-            self._disconnect_exception = ex
             self.transport.send_close(WSCloseCode.PROTOCOL_ERROR)
-            self._loop.call_later(_DISCONNECT_AFTER_ERROR_DELAY, self.transport.disconnect)
+        self._loop.call_later(_DISCONNECT_AFTER_ERROR_DELAY, self.transport.disconnect)
+        return NoResult.SUCCESS
 
     cdef inline WSFrame _get_next_frame_impl(self): #  -> Optional[WSFrame]
         """Return the next frame from the socket."""
