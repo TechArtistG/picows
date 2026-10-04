@@ -130,7 +130,7 @@ class picows_build_ext(build_ext):
 extensions = [
     Extension("picows.picows", ["picows/picows.pyx", "picows/mask_dispatch.c"],
               libraries=libs, define_macros=macros,
-              depends=["picows/compat.h"],
+              depends=["picows/compat.h", "picows/mask_key.h"],
               extra_compile_args=extra_compile_args,
               extra_link_args=extra_link_args),
     Extension("picows.websockets.asyncio.connection", ["picows/websockets/asyncio/connection.py"],

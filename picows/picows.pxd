@@ -133,6 +133,11 @@ cdef class WSTransport:
 
         MemoryBuffer _write_buffer
 
+        # Client side masking keys, see mask_key.h
+        uint32_t _mask_key_state[16]
+        uint32_t _mask_keys[16]
+        Py_ssize_t _mask_key_pos
+
 
     cdef inline NoResult send_reuse_external_buffer(self, WSMsgType msg_type,
                                                     char* msg_ptr, Py_ssize_t msg_size,
@@ -154,6 +159,7 @@ cdef class WSTransport:
     cdef inline NoResult _send(self, WSMsgType msg_type, message,
                                bint fin, bint rsv1, bint rsv2, bint rsv3) except NoResult.EXC
     cdef inline uint32_t _prepare_header(self, uint8_t* header_ptr, WSMsgType msg_type, Py_ssize_t msg_size, bint fin, bint rsv1, bint rsv2, bint rsv3) noexcept
+    cdef inline void _refill_mask_keys_if_used_up(self) noexcept
     cdef inline NoResult _send_http_handshake(self, bytes ws_path, bytes host_port,
                                               bytes websocket_key_b64, object extra_headers) except NoResult.EXC
     cdef inline NoResult _send_http_handshake_response(self, response,

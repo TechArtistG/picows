@@ -22,7 +22,6 @@ from cpython.unicode cimport PyUnicode_FromStringAndSize, PyUnicode_DecodeASCII,
 from cpython.pythread cimport PyThread_get_thread_ident
 
 from libc.string cimport memmove, memcpy
-from libc.stdlib cimport rand
 
 from aiofastnet.transport cimport Protocol as AiofnProtocol, Transport as AiofnTransport
 from aiofastnet.utils cimport NoResult as AiofnNoResult
@@ -101,6 +100,12 @@ cdef extern from "compat.h" nogil:
     const char* get_apply_mask_fast_impl_name()
     apply_mask_fn get_apply_mask_fast_fn()
     size_t get_apply_mask_fast_alignment()
+
+
+cdef extern from "mask_key.h" nogil:
+    const Py_ssize_t PICOWS_MASK_KEYS_PER_BLOCK
+    void picows_mask_key_gen_init(uint32_t* state, const uint8_t* seed)
+    void picows_mask_key_gen_next_block(uint32_t* state, uint32_t* keys)
 
 
 cdef:
@@ -728,6 +733,15 @@ cdef class WSTransport:
 
         self._write_buffer = MemoryBuffer(1024)
 
+        # Client side masking keys: per-transport ChaCha20 keystream seeded from the OS CSPRNG,
+        # see mask_key.h. Server side never masks; its key state stays zeroed and unused.
+        self._mask_key_pos = 0
+        cdef bytes seed
+        if is_client_side:
+            seed = os.urandom(40)
+            picows_mask_key_gen_init(self._mask_key_state, <const uint8_t*>PyBytes_AS_STRING(seed))
+            picows_mask_key_gen_next_block(self._mask_key_state, self._mask_keys)
+
     cdef NoResult _check_thread(self, meth) except NoResult.EXC:
         cdef unsigned long curr_thread_id = PyThread_get_thread_ident()
         if self._thread_id != curr_thread_id:
@@ -789,7 +803,10 @@ cdef class WSTransport:
             header_ptr += 8
 
         if self.is_client_side:
-            mask = <uint32_t>rand()
+            # Normally refilled right after the previous send, but that is skipped if the write raised
+            self._refill_mask_keys_if_used_up()
+            mask = self._mask_keys[self._mask_key_pos]
+            self._mask_key_pos += 1
             (<uint32_t*>header_ptr)[0] = mask
             header_ptr += 4
 
@@ -811,7 +828,15 @@ cdef class WSTransport:
             _mask_payload(<uint8_t*>msg_ptr, msg_size, mask, <uint8_t*>msg_ptr)
 
         self._fast_write(<char*>header_ptr, header_size + msg_size)
+        self._refill_mask_keys_if_used_up()
         return NoResult.SUCCESS
+
+    cdef void _refill_mask_keys_if_used_up(self) noexcept:
+        # Computing a new keystream block costs ~140 ns. Do it after the frame has been
+        # written, so it doesn't delay the frame that used the last key.
+        if self._mask_key_pos == PICOWS_MASK_KEYS_PER_BLOCK:
+            picows_mask_key_gen_next_block(self._mask_key_state, self._mask_keys)
+            self._mask_key_pos = 0
 
     cdef NoResult _send(self, WSMsgType msg_type, message,
                         bint fin, bint rsv1, bint rsv2, bint rsv3) except NoResult.EXC:
@@ -875,6 +900,7 @@ cdef class WSTransport:
             self._fast_write(
                 <char*>(masked_msg_ptr - header_size), header_size + msg_size
             )
+        self._refill_mask_keys_if_used_up()
         return NoResult.SUCCESS
 
     cdef NoResult send_reuse_external_buffer(self, WSMsgType msg_type,
@@ -1261,6 +1287,9 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         Py_ssize_t _max_frame_size
 
         bint _enable_auto_pong
+        # Payload of the last PING received in the current read, answered after all frames
+        # of the read have been delivered. None when there is nothing to answer.
+        bytes _pending_pong_payload
         bint _enable_auto_ping
         object _auto_ping_idle_timeout
         object _auto_ping_reply_timeout
@@ -1325,6 +1354,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         self._max_frame_size = max_frame_size
 
         self._enable_auto_pong = enable_auto_pong
+        self._pending_pong_payload = None
         self._enable_auto_ping = enable_auto_ping
         self._auto_ping_idle_timeout = auto_ping_idle_timeout
         self._auto_ping_reply_timeout = auto_ping_reply_timeout
@@ -1540,6 +1570,7 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
             frame.last_in_buffer = 1
             self._invoke_on_ws_frame(frame)
             self._shrink_buffer()
+            self._send_pending_pong()
             return NoResult.SUCCESS
         else:
             self._invoke_on_ws_frame(frame)
@@ -1552,6 +1583,19 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
             self._invoke_on_ws_frame(frame)
 
         self._shrink_buffer()
+        self._send_pending_pong()
+        return NoResult.SUCCESS
+
+    cdef inline NoResult _send_pending_pong(self) except NoResult.EXC:
+        # PONG is sent after all frames of the read have been delivered, so that frames
+        # following a PING aren't delayed by the PONG write. If several PINGs arrived in
+        # one read, only the last one is answered (RFC 6455 5.5.3).
+        if cython.unlikely(self._pending_pong_payload is not None):
+            payload = self._pending_pong_payload
+            self._pending_pong_payload = None
+            self.transport.send_pong(payload)
+            if self._log_debug_enabled:
+                self._logger.log(_DEBUG_LL, "Replied with PONG(%s)", payload)
         return NoResult.SUCCESS
 
     cdef inline _negotiate(self):
@@ -1993,10 +2037,10 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
     cdef inline NoResult _invoke_on_ws_frame(self, WSFrame frame) except NoResult.EXC:
         try:
             if cython.unlikely(self._enable_auto_pong and frame.msg_type == WSMsgType.PING):
-                payload = frame.get_payload_as_bytes()
-                self.transport.send_pong(payload)
+                self._pending_pong_payload = frame.get_payload_as_bytes()
                 if self._log_debug_enabled:
-                    self._logger.log(_DEBUG_LL, "PING(%s) frame received, replied with PONG", payload)
+                    self._logger.log(_DEBUG_LL, "PING(%s) frame received, PONG will be sent after the current read",
+                                     self._pending_pong_payload)
                 return NoResult.SUCCESS
 
             if cython.unlikely(self._enable_auto_ping and self.transport.auto_ping_expect_pong or self.transport.pong_received_at_future is not None):
