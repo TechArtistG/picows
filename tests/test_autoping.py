@@ -206,6 +206,46 @@ async def test_periodic_ping_when_data_is_present():
                 assert f.msg_type == picows.WSMsgType.PING
 
 
+async def test_periodic_ping_interval():
+    # for PING_PERIODICALLY, auto_ping_idle_timeout is the interval between pings,
+    # auto_ping_reply_timeout must not be added to it.
+    loop = asyncio.get_running_loop()
+    # reply_timeout == idle_timeout maximizes the gap between the correct interval
+    # (idle_timeout) and the old buggy one (idle_timeout + reply_timeout).
+    idle_timeout = 0.4
+    reply_timeout = 0.4
+    num_pings = 4
+
+    class ClientListener(AsyncClient):
+        def __init__(self):
+            super().__init__()
+            self.ping_times = []
+
+        def on_ws_frame(self, transport: picows.WSTransport, frame: picows.WSFrame):
+            if frame.msg_type == picows.WSMsgType.PING:
+                self.ping_times.append(loop.time())
+                transport.send_pong(frame.get_payload_as_bytes())
+                if len(self.ping_times) == num_pings:
+                    transport.disconnect()
+
+    async with async_timeout.timeout(TIMEOUT + num_pings * (idle_timeout + reply_timeout)):
+        async with WSServer(lambda _: picows.WSListener(),
+                            enable_auto_ping=True,
+                            auto_ping_idle_timeout=idle_timeout,
+                            auto_ping_reply_timeout=reply_timeout,
+                            auto_ping_strategy=picows.WSAutoPingStrategy.PING_PERIODICALLY,
+                            enable_auto_pong=False
+                            ) as server:
+            async with WSClient(server, ClientListener, enable_auto_pong=False) as client:
+                await client.transport.wait_disconnected()
+
+    assert len(client.ping_times) == num_pings
+    # Average over all intervals, so that a single event loop stall on a slow CI runner
+    # doesn't fail the test. The old behavior averaged idle_timeout + reply_timeout.
+    mean_interval = (client.ping_times[-1] - client.ping_times[0]) / (num_pings - 1)
+    assert idle_timeout - 0.05 < mean_interval < idle_timeout + reply_timeout / 2
+
+
 async def test_send_user_specific_ping_exception():
     # Expect server to disconnect us with CLOSE(INTERNAL_ERROR) when send_user_specific_ping throws
     class ServerClientListener(picows.WSListener):

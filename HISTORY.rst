@@ -5,6 +5,19 @@ picows Release History
    :depth: 1
    :local:
 
+Unreleased
+----------
+
+* Fix masking reading and writing up to 4 bytes past the end of the payload when the payload tail is 4 bytes
+  or longer. Also fix undefined behaviour (32-bit shift by 32) in the mask rotation helper.
+* SSE2/AVX2/AVX512 masking now uses regular instead of non-temporal stores. The masked frame is read back
+  right away by send()/TLS, and non-temporal stores forced that read to go to RAM: masking + reading a 1 KB
+  frame was ~8x slower.
+* ``ws_connect`` defaults ``happy_eyeballs_delay`` to 0.25 seconds when aiofastnet is used. Previously
+  an unreachable address family (typically broken IPv6) stalled connecting for several seconds.
+* Fix ``PING_PERIODICALLY`` sending pings every ``auto_ping_idle_timeout + auto_ping_reply_timeout``
+  seconds instead of every ``auto_ping_idle_timeout`` seconds.
+
 2.3.1 (2026-09-15)
 ------------------
 

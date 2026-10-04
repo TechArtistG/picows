@@ -1614,6 +1614,9 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
         cdef double now
         cdef double prev_last_data_time
         cdef double idle_delay
+        # PING_PERIODICALLY: next ping is due auto_ping_idle_timeout after the previous one,
+        # time spent waiting for PONG is part of that interval.
+        cdef double next_periodic_ping_time = picows_get_monotonic_time() + <double>self._auto_ping_idle_timeout
         cdef object sleep = asyncio.sleep
         try:
             if cython.unlikely(self._log_debug_enabled):
@@ -1633,7 +1636,8 @@ cdef class WSProtocol(WSProtocolBase, asyncio.BufferedProtocol):
                     if cython.unlikely(self._log_debug_enabled):
                         self._logger.log(_DEBUG_LL, "Send PING because no new data over the last %s seconds", self._auto_ping_idle_timeout)
                 else:
-                    await sleep(self._auto_ping_idle_timeout)
+                    await sleep(next_periodic_ping_time - picows_get_monotonic_time())
+                    next_periodic_ping_time = picows_get_monotonic_time() + <double>self._auto_ping_idle_timeout
 
                     if cython.unlikely(self._log_debug_enabled):
                         self._logger.log(_DEBUG_LL, "Send periodic PING")
